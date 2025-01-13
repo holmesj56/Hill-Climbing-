@@ -1,0 +1,113 @@
+// Target specification for the Lingua Franca runtime environment
+target C {
+    platform: { // Specifies the platform and board details
+      name: "rp2040", 
+      board: "pololu_3pi_2040_robot"
+    },
+    single-threaded: true // Ensures the program runs on a single thread
+}
+
+// Importing necessary libraries for motor control, gyroscope, and line detection
+import Motors from "lib/Motors.lf"
+import GyroAngle from "lib/IMU.lf"
+import LineDetect from "HillLineDetectSolution.lf"
+
+// Reactor for controlling the robot
+reactor Robot {
+    state angle:int // State to store the target angle for turns
+    state L:bool // State to indicate line detected on the left
+    state R:bool // State to indicate line detected on the right
+    state C:bool // State to indicate line detected at the center
+
+    linedetect = new LineDetect() // Instance for line detection
+    motors = new Motors() // Instance for motor control
+
+    timer t(0, 15ms) // Timer for periodic actions
+
+    // Initial mode for calibration
+    initial mode CALIBRATING {
+        // Transition to DRIVING mode upon line detection
+        reaction(linedetect.left, linedetect.right, linedetect.center) -> reset(DRIVING) {=
+            lf_set_mode(DRIVING); // Switch to DRIVING mode
+        =}
+    }
+
+    // DRIVING mode for forward movement and line detection
+    mode DRIVING {
+        // Set motor power when entering DRIVING mode
+        reaction(reset) -> motors.left_power, motors.right_power {=
+            lf_set(motors.left_power, 0.1); // Set left motor power to 0.1
+            lf_set(motors.right_power, 0.1); // Set right motor power to 0.1
+        =}
+
+        // Transition to LineDetect mode upon detecting a line
+        reaction(linedetect.left, linedetect.right, linedetect.center) -> reset(LineDetect) {=
+            self->L = linedetect.left->value; // Update left line detection state
+            self->R = linedetect.right->value; // Update right line detection state
+            self->C = linedetect.center->value; // Update center line detection state
+
+            if(linedetect.left->value || linedetect.right->value || linedetect.center->value) {
+                lf_set_mode(LineDetect); // Switch to LineDetect mode
+            }
+        =}
+    }
+
+    // LineDetect mode for handling line-following logic
+    mode LineDetect {
+        logical action turn // Logical action for scheduling turns
+
+        // Reverse motors briefly before scheduling a turn
+        reaction(reset) -> motors.left_power, motors.right_power, turn, reset(TURN) {=
+            lf_set(motors.left_power, -0.1); // Set left motor power to reverse
+            lf_set(motors.right_power, -0.1); // Set right motor power to reverse
+
+            lf_schedule(turn, MSEC(200)); // Schedule turn after 200 ms
+        =}
+
+        // Transition to TURN mode for executing the turn
+        reaction(turn) -> reset(TURN) {=
+            lf_set_mode(TURN); // Switch to TURN mode
+        =}
+    }
+
+    // TURN mode for executing turns based on line sensor state
+    mode TURN {
+        gyro = new GyroAngle() // Instance for gyroscope readings
+
+        // Reaction to handle turning logic and return to DRIVING mode
+        reaction(reset) -> motors.left_power, motors.right_power, reset(DRIVING) {=
+            if(self->C) { // U-turn logic for center detection
+                self->angle = 180;
+                lf_set(motors.left_power, -0.1); // Set left motor power to reverse
+                lf_set(motors.right_power, 0.1); // Set right motor power to forward
+            } else if(self->L) { // Left turn logic
+                self->angle = 30;
+                lf_set(motors.left_power, 0.1); // Set left motor power to forward
+                lf_set(motors.right_power, -0.1); // Set right motor power to reverse
+            } else if(self->R) { // Right turn logic
+                self->angle = 30;
+                lf_set(motors.left_power, -0.1); // Set left motor power to reverse
+                lf_set(motors.right_power, 0.1); // Set right motor power to forward
+            } else { // Default to DRIVING mode if no line detected
+                lf_set_mode(DRIVING);
+            }
+        =}
+
+        // Trigger gyroscope updates at regular intervals
+        reaction(t) -> gyro.trigger {=
+            lf_set(gyro.trigger, true); // Trigger gyroscope reading
+        =}
+
+        // Transition back to DRIVING mode when the turn angle is achieved
+        reaction(gyro.z) -> reset(DRIVING) {=
+            if(abs(gyro.z->value) > self->angle) { // Check if the turn angle is reached
+                lf_set_mode(DRIVING); // Switch back to DRIVING mode
+            }
+        =}
+    }
+}
+
+// Main reactor to instantiate the Robot reactor
+main reactor {
+    robot = new Robot() // Create a new instance of the Robot reactor
+}

@@ -1,0 +1,91 @@
+// Target specification for the Lingua Franca runtime environment
+target C {
+    platform: { // Specifies platform and board details
+      name: "rp2040", 
+      board: "pololu_3pi_2040_robot"
+    },
+    single-threaded: true // Ensures the program runs on a single thread
+}
+
+// Import required libraries for line sensing and display
+import Line from "lib/Line.lf"
+import Display from "lib/Display.lf"
+
+// Reactor for detecting lines and displaying status
+reactor LineDetect(calibration_time: time = 10 s, sample_period: time = 100 ms) {
+    output left:bool // Output to indicate detection on the left side
+    output right:bool // Output to indicate detection on the right side
+    output center:bool // Output to indicate detection in the center
+
+    line = new Line() // Instance for line sensor functionality
+    disp = new Display() // Instance for display functionality
+
+    timer t(0, sample_period) // Timer for periodic line sensing
+    timer seconds(0, 1 s) // Timer used for updating elapsed time display
+    timer end_calibration(calibration_time) // Timer for ending calibration period
+
+    state count: int = 0 // State variable for elapsed time in seconds
+
+    // Reaction triggered at startup to display calibration instructions
+    reaction(startup) -> disp.line0, disp.line1, disp.line2 {=
+        lf_set(disp.line0, "CALIBRATING"); // Display "CALIBRATING" message
+        lf_set(disp.line1, "Roll robot over"); // Display rolling instruction
+        lf_set(disp.line2, "light and dark."); // Display calibration context
+    =}
+
+    // Reaction to update elapsed time on the display every second
+    reaction(seconds) -> disp.line3 {=
+        static char buf[17]; // Buffer for formatted string
+        snprintf(buf, 17, "time:%8d s", self->count++); // Format elapsed time
+        lf_set(disp.line3, buf); // Update the display with elapsed time
+    =}
+
+    // Reaction to end calibration by disabling calibration mode on the sensor
+    reaction(end_calibration) -> line.calibrate {=
+        lf_set(line.calibrate, false); // Disable calibration mode
+    =}
+
+    // Reaction to trigger the line sensor periodically
+    reaction(t) -> line.trigger {=
+        lf_set(line.trigger, true); // Activate the line sensor
+    =}
+
+    // Reaction to process line sensor reflection data and update outputs and display
+    reaction(line.reflect) -> disp.line0, disp.line1, disp.line2, left, right, center {=
+        static char buf0[17]; // Buffer for left status
+        static char buf1[17]; // Buffer for right status
+        static char buf2[17]; // Buffer for center status
+
+        // Check reflection values for left side detection
+        if (line.reflect->value[0] > 800 || line.reflect->value[1] > 800) {
+            snprintf(buf0, 17, "Left"); // Set display to "Left"
+            lf_set(left, true); // Set left output to true
+        } else {
+            snprintf(buf0, 17, ""); // Clear display for left
+            lf_set(left, false); // Set left output to false
+        }
+
+        // Check reflection values for right side detection
+        if (line.reflect->value[3] > 800 || line.reflect->value[4] > 800) {
+            snprintf(buf1, 17, "Right"); // Set display to "Right"
+            lf_set(right, true); // Set right output to true
+        } else {
+            snprintf(buf1, 17, ""); // Clear display for right
+            lf_set(right, false); // Set right output to false
+        }
+
+        // Check reflection value for center detection
+        if (line.reflect->value[2] > 800) {
+            snprintf(buf2, 17, "Centre"); // Set display to "Centre"
+            lf_set(center, true); // Set center output to true
+        } else {
+            snprintf(buf2, 17, ""); // Clear display for center
+            lf_set(center, false); // Set center output to false
+        }
+
+        // Update the display with detection results
+        lf_set(disp.line0, buf0);
+        lf_set(disp.line1, buf1);
+        lf_set(disp.line2, buf2);
+    =}
+}

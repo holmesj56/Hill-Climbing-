@@ -1,0 +1,188 @@
+// Target specification for the Lingua Franca runtime environment
+target C {
+    platform: { // Specifies platform and board details
+      name: "rp2040", 
+      board: "pololu_3pi_2040_robot"
+    },
+    single-threaded: true // Ensures the program runs on a single thread
+}
+
+// Importing required libraries for accelerometer, gyroscope, line detection, motor control, and encoder feedback
+import Accelerometer from "lib/IMU.lf"
+import GyroAngle from "lib/IMU.lf"
+import LineDetect from "HillLineDetectSolution.lf"
+import MotorsWithFeedback from "lib/MotorsWithFeedback.lf"
+import Encoders from "lib/Encoders.lf"
+
+// Preamble to include math library for calculations
+preamble {=
+    #include <math.h>
+=}
+
+// Reactor for calculating tilt using accelerometer data
+reactor Tilt {
+    input trigger:bool; // Input to trigger the accelerometer readings
+    output x: float; // Output for tilt angle along the x-axis
+    output y: float; // Output for tilt angle along the y-axis
+    output z: float; // Output for tilt angle along the z-axis
+    a = new Accelerometer(); // Instance of accelerometer
+
+    // Reaction to trigger the accelerometer
+    reaction(trigger) -> a.trigger {=
+        lf_set(a.trigger, true); // Trigger accelerometer readings
+    =}
+
+    // Reaction to calculate tilt angles from accelerometer data
+    reaction(a.x, a.y, a.z) -> x, y, z {=
+        float g = 9.80665; // Gravity constant
+
+        // Normalize accelerometer readings for x, y, and z
+        float x_val = a.x->value;
+        if(x_val > 1) { x_val = 1; }
+        else if(x_val < -1) { x_val = -1; }
+        
+        float y_val = a.y->value;
+        if(y_val > 1) { y_val = 1; }
+        else if(y_val < -1) { y_val = -1; }
+        
+        float z_val = a.z->value;
+        if(z_val > 1) { z_val = 1; }
+        else if(z_val < -1) { z_val = -1; }
+
+        // Calculate tilt angles in degrees
+        lf_set(x, asin(x_val) * (180/M_PI));
+        lf_set(y, asin(y_val) * (180/M_PI));
+        lf_set(z, asin(z_val) * (180/M_PI));
+    =}
+}
+
+// Reactor for controlling the robot
+reactor Robot {
+    state angle:int // Stores the target angle for turns
+    state L:bool // Indicates line detected on the left
+    state R:bool // Indicates line detected on the right
+    state C:bool // Indicates line detected in the center
+    state Uturn:bool=false // Flag to indicate a U-turn condition
+
+    linedetect = new LineDetect() // Instance for line detection
+    motors = new MotorsWithFeedback() // Instance for motor control with feedback
+    encoder = new Encoders() // Instance for encoder readings
+
+    // Connect encoder outputs to motor feedback inputs
+    encoder.right -> motors.right;
+    encoder.left -> motors.left;
+
+    tilt = new Tilt() // Instance for tilt calculations
+    timer t1(0, 10ms) // Timer for periodic encoder updates
+    timer t2(0, 50ms) // Timer for periodic tilt updates
+
+    // Reaction to trigger encoder readings
+    reaction(t1) -> encoder.trigger {=
+        lf_set(encoder.trigger, true);
+    =}
+
+    // Initial calibration mode
+    initial mode CALIBRATING {
+        // Transition to DRIVING mode upon line detection
+        reaction(linedetect.left, linedetect.center, linedetect.right) -> reset(DRIVING) {=
+            lf_set_mode(DRIVING);
+        =}
+    }
+
+    // Driving mode for forward movement and tilt adjustments
+    mode DRIVING {
+        // Initialize motor speeds when entering DRIVING mode
+        reaction(reset) -> motors.left_speed, motors.right_speed {=
+            lf_set(motors.left_speed, 0.1);
+            lf_set(motors.right_speed, 0.1);
+        =}
+
+        // Trigger tilt calculation at regular intervals
+        reaction(t2) -> tilt.trigger {=
+            lf_set(tilt.trigger, true);
+        =}
+
+        // Adjust motor speeds based on tilt angles
+        reaction(tilt.x, tilt.y) -> motors.left_speed, motors.right_speed, reset(TURN) {=
+            if(tilt.x->value <= 0 && !self->Uturn) { // Trigger U-turn condition
+                self->angle = 180;
+                self->Uturn = true;
+                lf_set_mode(TURN);
+            }
+
+            // Adjust motor speeds proportionally based on tilt
+            lf_set(motors.left_speed, 0.1 * (1.0 - 0.05 * tilt.y->value * ((tilt.x->value >= 0) ? 1.0 : -1.0)));
+            lf_set(motors.right_speed, 0.1 * (1.0 + 0.05 * tilt.y->value * ((tilt.x->value >= 0) ? 1.0 : -1.0)));
+        =}
+
+        // Transition to line detection mode upon line detection
+        reaction(linedetect.left, linedetect.right, linedetect.center) -> reset(LineDetect) {=
+            self->L = linedetect.left->value;
+            self->R = linedetect.right->value;
+            self->C = linedetect.center->value;
+
+            if(self->L || self->R || self->C){
+                lf_set_mode(LineDetect);
+            }
+        =}
+    }
+
+    // Line detection mode for handling line-following logic
+    mode LineDetect {
+        logical action turn // Logical action for scheduling turns
+
+        // Reverse motors briefly before turning
+        reaction(reset) -> motors.left_speed, motors.right_speed, turn, reset(TURN) {=
+            lf_set(motors.left_speed, -0.1);
+            lf_set(motors.right_speed, -0.1);
+
+            lf_schedule(turn, MSEC(200)); // Schedule a turn after reversing
+        =}
+
+        // Transition to TURN mode for executing a turn
+        reaction(turn) -> reset(TURN) {=
+            lf_set_mode(TURN);
+        =}
+    }
+
+    // Turn mode for executing turns based on sensor data
+    mode TURN {
+        gyro = new GyroAngle() // Instance for gyroscope readings
+
+        // Reaction to handle turning logic based on line sensor state
+        reaction(reset) -> motors.left_speed, motors.right_speed, reset(DRIVING) {=
+            if(self->C) { // U-turn logic for center detection
+                self->angle = 180;
+                lf_set(motors.left_speed, -0.1);
+                lf_set(motors.right_speed, 0.1);
+            } else if(self->L) { // Turn logic for left detection
+                self->angle = 30;
+                lf_set(motors.left_speed, 0.1);
+                lf_set(motors.right_speed, -0.1);
+            } else if(self->R) { // Turn logic for right detection
+                self->angle = 30;
+                lf_set(motors.left_speed, -0.1);
+                lf_set(motors.right_speed, 0.1);
+            } else { // Default to DRIVING mode if no line detected
+                lf_set_mode(DRIVING);
+            }
+        =}
+
+        // Trigger gyroscope updates
+        reaction(t1) -> gyro.trigger {=
+            lf_set(gyro.trigger, true);
+        =}
+
+        // Transition back to DRIVING mode when the turn is complete
+        reaction(gyro.z) -> reset(DRIVING) {=
+            if(abs(gyro.z->value) > self->angle){
+                lf_set_mode(DRIVING);
+            }
+        =}
+    }
+}
+
+// Main reactor to instantiate the Robot reactor
+main reactor {
+    robot = new Robot()
+}
